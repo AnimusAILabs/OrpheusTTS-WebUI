@@ -24,7 +24,6 @@
       transition: width 0.3s ease;
     }
   </style>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/howler/2.2.4/howler.min.js"></script>
 </head>
 <body>
   <h1>Streaming Audio Playback</h1>
@@ -44,17 +43,15 @@
 
   <script>
     // Use the RunPod WebSocket URL directly
-    const wsUrl = 'wss://zak02hx803s9le-8080.proxy.runpod.net/ws';
+    const wsUrl = 'wss://umukid49349ire-8080.proxy.runpod.net/ws';
     const ws = new WebSocket(wsUrl);
-    let isFirstChunk = true;
-    let isGenerating = false;
-    let sound = null;
-    let audioChunks = [];
-    let currentBlob = null;
-    let hasStartedPlaying = false;
-    let lastPlayPosition = 0;
-    const MIN_CHUNKS_TO_PLAY = 3;  // Start playing after this many chunks
-    let updateInterval = null;
+    let audioContext = null;
+    let mediaStreamDestination = null;
+    let audioQueue = [];
+    let isPlaying = false;
+    let startTime = 0;
+    let totalDuration = 0;
+    let processedDuration = 0;
 
     function showStatus(message) {
       document.getElementById('status').textContent = message;
@@ -64,13 +61,40 @@
       document.getElementById('progressBar').style.width = `${progress}%`;
     }
 
+    // Initialize WebRTC audio context
+    function initAudio() {
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 24000});
+        mediaStreamDestination = audioContext.createMediaStreamDestination();
+      }
+    }
+
+    // Process audio chunks
+    function processAudioChunk(chunk) {
+      if (!audioContext || !isPlaying) return;
+
+      const buffer = audioContext.createBuffer(1, chunk.length, 24000);
+      buffer.copyToChannel(chunk, 0);
+      
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(mediaStreamDestination);
+      
+      const currentTime = audioContext.currentTime;
+      source.start(currentTime + processedDuration);
+      
+      processedDuration += chunk.length / 24000;
+      updateProgress((processedDuration / totalDuration) * 100);
+    }
+
     // Initialize controls
     const pauseButton = document.getElementById('pauseButton');
     const resumeButton = document.getElementById('resumeButton');
     
     pauseButton.onclick = () => {
-      if (sound) {
-        sound.pause();
+      if (audioContext && isPlaying) {
+        audioContext.suspend();
+        isPlaying = false;
         pauseButton.disabled = true;
         resumeButton.disabled = false;
         showStatus('Playback paused');
@@ -78,146 +102,19 @@
     };
     
     resumeButton.onclick = () => {
-      if (sound) {
-        sound.play();
+      if (audioContext && !isPlaying) {
+        audioContext.resume();
+        isPlaying = true;
         pauseButton.disabled = false;
         resumeButton.disabled = true;
         showStatus('Playing audio...');
+        
+        // Process any queued chunks
+        while (audioQueue.length > 0) {
+          processAudioChunk(audioQueue.shift());
+        }
       }
     };
-
-    function createWavBlob(chunks) {
-      // Calculate total audio data length (excluding header from first chunk)
-      const totalLength = chunks.reduce((acc, chunk, index) => 
-        acc + (index === 0 ? chunk.length - 44 : chunk.length), 0);
-      
-      // Create combined buffer with header
-      const combinedChunks = new Uint8Array(44 + totalLength);
-      
-      // Write WAV header
-      const header = new Uint8Array([
-        // RIFF chunk
-        0x52, 0x49, 0x46, 0x46, // "RIFF"
-        (totalLength + 36) & 0xff, ((totalLength + 36) >> 8) & 0xff, ((totalLength + 36) >> 16) & 0xff, ((totalLength + 36) >> 24) & 0xff, // File size
-        0x57, 0x41, 0x56, 0x45, // "WAVE"
-        // fmt chunk
-        0x66, 0x6d, 0x74, 0x20, // "fmt "
-        0x10, 0x00, 0x00, 0x00, // Chunk size: 16
-        0x01, 0x00, // Audio format: 1 (PCM)
-        0x01, 0x00, // Number of channels: 1
-        0x80, 0x5D, 0x00, 0x00, // Sample rate: 24000
-        0x00, 0xBB, 0x00, 0x00, // Byte rate: 48000
-        0x02, 0x00, // Block align: 2
-        0x10, 0x00, // Bits per sample: 16
-        // data chunk
-        0x64, 0x61, 0x74, 0x61, // "data"
-        totalLength & 0xff, (totalLength >> 8) & 0xff, (totalLength >> 16) & 0xff, (totalLength >> 24) & 0xff // Data size
-      ]);
-      
-      combinedChunks.set(header, 0);
-      
-      // Copy audio data (skipping header from first chunk)
-      let offset = 44;
-      chunks.forEach((chunk, index) => {
-        if (index === 0) {
-          combinedChunks.set(chunk.slice(44), offset);
-          offset += chunk.length - 44;
-        } else {
-          combinedChunks.set(chunk, offset);
-          offset += chunk.length;
-        }
-      });
-      
-      return new Blob([combinedChunks], { type: 'audio/wav' });
-    }
-
-    function updateAudio(shouldStartPlaying = false) {
-      if (audioChunks.length === 0) return;
-
-      // Store current playback position if sound is playing
-      if (sound && sound.playing()) {
-        lastPlayPosition = sound.seek();
-      }
-
-      // Clean up previous audio
-      if (currentBlob) {
-        URL.revokeObjectURL(currentBlob);
-      }
-
-      const blob = createWavBlob(audioChunks);
-      const url = URL.createObjectURL(blob);
-      currentBlob = url;
-
-      const wasPlaying = sound && sound.playing();
-
-      if (sound) {
-        sound.unload();
-      }
-
-      sound = new Howl({
-        src: [url],
-        format: ['wav'],
-        html5: true, // Force HTML5 Audio for streaming
-        pool: 1, // Reduce the pool size since we're streaming
-        preload: true, // Ensure we preload the audio
-        onload: function() {
-          // Resume from last position if we were playing
-          if (wasPlaying || shouldStartPlaying) {
-            this.seek(lastPlayPosition);
-            this.play();
-          }
-        },
-        onplay: () => {
-          pauseButton.disabled = false;
-          resumeButton.disabled = true;
-          showStatus('Playing audio...');
-        },
-        onpause: () => {
-          pauseButton.disabled = true;
-          resumeButton.disabled = false;
-          showStatus('Playback paused');
-        },
-        onend: () => {
-          pauseButton.disabled = true;
-          resumeButton.disabled = true;
-          showStatus('Playback completed');
-          updateProgress(100);
-          if (updateInterval) {
-            clearInterval(updateInterval);
-          }
-        },
-        onloaderror: (id, err) => {
-          console.error('Error loading audio:', err);
-          showStatus(`Error loading audio: ${err}`);
-          // Try to recover by reducing buffer and restarting
-          if (audioChunks.length > MIN_CHUNKS_TO_PLAY) {
-            audioChunks = audioChunks.slice(-MIN_CHUNKS_TO_PLAY);
-            updateAudio(wasPlaying);
-          }
-        },
-        onplayerror: (id, err) => {
-          console.error('Error playing audio:', err);
-          showStatus(`Error playing audio: ${err}`);
-          // Try to recover by waiting for more chunks
-          if (sound) {
-            sound.unload();
-            sound = null;
-          }
-        }
-      });
-
-      // Update progress
-      if (updateInterval) {
-        clearInterval(updateInterval);
-      }
-      
-      updateInterval = setInterval(() => {
-        if (sound && sound.playing()) {
-          const progress = (sound.seek() / sound.duration()) * 100;
-          updateProgress(Math.min(100, Math.max(0, progress)));
-        }
-      }, 100);
-    }
 
     // WebSocket event handlers
     ws.onopen = () => {
@@ -228,9 +125,6 @@
     ws.onclose = () => {
       console.log('Disconnected from RunPod server');
       showStatus('Disconnected from RunPod server');
-      if (updateInterval) {
-        clearInterval(updateInterval);
-      }
     };
 
     ws.onerror = (error) => {
@@ -244,32 +138,35 @@
       if (data.type === 'audio_chunk') {
         const chunk = new Uint8Array(hexToArrayBuffer(data.chunk));
         
-        if (isFirstChunk) {
-          isFirstChunk = false;
-          audioChunks = [chunk];
-          // Don't start playing yet, wait for more chunks
-          updateAudio(false);
-        } else {
-          audioChunks.push(chunk);
-          // Start playing if we have enough chunks and haven't started yet
-          if (!hasStartedPlaying && audioChunks.length >= MIN_CHUNKS_TO_PLAY) {
-            hasStartedPlaying = true;
-            updateAudio(true);
-          } else if (hasStartedPlaying && sound) {
-            // Only update audio if we're near the end of the current buffer
-            // or if we've accumulated significantly more chunks
-            const timeRemaining = sound.duration() - sound.seek();
-            if (timeRemaining < 0.5 || audioChunks.length > MIN_CHUNKS_TO_PLAY * 2) {
-              updateAudio(true);
-            }
-          }
+        if (!audioContext) {
+          initAudio();
+          isPlaying = true;
+          pauseButton.disabled = false;
+          resumeButton.disabled = true;
+          showStatus('Playing audio...');
         }
+
+        try {
+          // Convert 16-bit PCM to float32
+          const floatData = new Float32Array(chunk.length / 2);
+          const view = new DataView(chunk.buffer);
+          for (let i = 0; i < floatData.length; i++) {
+            floatData[i] = view.getInt16(i * 2, true) / 32768.0;
+          }
+          
+          if (isPlaying) {
+            processAudioChunk(floatData);
+          } else {
+            audioQueue.push(floatData);
+          }
+        } catch (error) {
+          console.error('Error processing audio chunk:', error);
+        }
+        
       } else if (data.type === 'generation_complete') {
         console.log('Audio generation completed');
-        isGenerating = false;
-        showStatus('Generation complete');
-        // Final update to ensure all audio is included
-        updateAudio(hasStartedPlaying);
+        showStatus('Audio streaming completed');
+        totalDuration = processedDuration;
       }
     };
 
@@ -286,26 +183,14 @@
     document.getElementById("promptForm").addEventListener("submit", async function(event) {
       event.preventDefault();
       
-      if (isGenerating) {
-        showStatus('Already generating audio, please wait...');
-        return;
-      }
-
       // Reset state
-      isFirstChunk = true;
-      isGenerating = true;
-      hasStartedPlaying = false;
-      audioChunks = [];
+      if (audioContext) {
+        audioContext.suspend();
+      }
+      audioQueue = [];
+      processedDuration = 0;
+      totalDuration = 0;
       updateProgress(0);
-      
-      if (currentBlob) {
-        URL.revokeObjectURL(currentBlob);
-        currentBlob = null;
-      }
-      if (sound) {
-        sound.unload();
-        sound = null;
-      }
       
       // Disable controls initially
       pauseButton.disabled = true;
@@ -316,16 +201,6 @@
       
       // Request new audio generation
       ws.send(JSON.stringify({ prompt: prompt }));
-    });
-
-    // Clean up when page unloads
-    window.addEventListener('beforeunload', () => {
-      if (currentBlob) {
-        URL.revokeObjectURL(currentBlob);
-      }
-      if (sound) {
-        sound.unload();
-      }
     });
   </script>
 </body>

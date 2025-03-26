@@ -3,6 +3,7 @@ from flask_sock import Sock
 import struct
 import json
 import os
+import time
 
 # Set environment variables for vLLM
 os.environ["VLLM_MAX_MODEL_LEN"] = "100000"
@@ -54,28 +55,6 @@ sock = Sock(app)
 def index():
     return send_from_directory('.', 'client.html')
 
-def create_wav_header(sample_rate=24000, bits_per_sample=16, channels=1):
-    byte_rate = sample_rate * channels * bits_per_sample // 8
-    block_align = channels * bits_per_sample // 8
-    data_size = 0
-    header = struct.pack(
-        '<4sI4s4sIHHIIHH4sI',
-        b'RIFF',
-        36 + data_size,       
-        b'WAVE',
-        b'fmt ',
-        16,                  
-        1,             
-        channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        bits_per_sample,
-        b'data',
-        data_size
-    )
-    return header
-
 @sock.route('/ws')
 def websocket_endpoint(ws):
     while True:
@@ -86,9 +65,6 @@ def websocket_endpoint(ws):
                 
             data = json.loads(ws.receive())
             prompt = data.get('prompt', 'Hey there, looks like you forgot to provide a prompt!')
-            
-            # Send WAV header first
-            ws.send(json.dumps({'type': 'audio_chunk', 'chunk': create_wav_header().hex()}))
             
             # Generate and stream audio chunks
             syn_tokens = engine.generate_speech(
@@ -101,8 +77,15 @@ def websocket_endpoint(ws):
                 top_p=0.9
             )
             
+            # Stream chunks with controlled timing
+            chunk_size = 4096  # Optimal chunk size for streaming
             for chunk in syn_tokens:
-                ws.send(json.dumps({'type': 'audio_chunk', 'chunk': chunk.hex()}))
+                # Split large chunks into smaller ones for smoother streaming
+                for i in range(0, len(chunk), chunk_size):
+                    sub_chunk = chunk[i:i + chunk_size]
+                    ws.send(json.dumps({'type': 'audio_chunk', 'chunk': sub_chunk.hex()}))
+                    # Small delay to prevent overwhelming the client
+                    time.sleep(0.01)
             
             # Send end signal
             ws.send(json.dumps({'type': 'generation_complete'}))
@@ -120,8 +103,6 @@ def tts():
     prompt = request.args.get('prompt', 'Hey there, looks like you forgot to provide a prompt!')
 
     def generate_audio_stream():
-        yield create_wav_header()
-
         syn_tokens = engine.generate_speech(
             prompt=prompt,
             voice="tara",

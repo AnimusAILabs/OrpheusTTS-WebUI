@@ -1,0 +1,5 @@
+1. Intiliazie the model so it doesn't load model/checkpoints on first request making it take a long time
+2. Perform health checks for when the model is ready. Log these out in terminal
+3. Dockerize the realtime_streaming example and make it ready for production
+4. Part of making this ready for production is we should secure this container with an API key for access
+5. How do we handle scaling or autoscaling? Can we deploy this container on Daily.co or Pipecat to handle websocket auto scaling? Note however we need to use Runpod since the container needs to run on a specific GPU.
