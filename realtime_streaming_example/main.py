@@ -106,8 +106,6 @@ def websocket_endpoint(ws):
                         'context_id': context_id,
                         'chunk': bytes(chunk_to_send).hex()
                     }))
-                    # Small delay to prevent overwhelming the client
-                    time.sleep(0.01)
             
             # Send any remaining audio data
             if audio_buffer:
