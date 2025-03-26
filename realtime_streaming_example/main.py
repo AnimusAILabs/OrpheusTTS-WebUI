@@ -4,6 +4,7 @@ import struct
 import json
 import os
 import time
+import uuid
 
 # Set environment variables for vLLM
 os.environ["VLLM_MAX_MODEL_LEN"] = "100000"
@@ -66,6 +67,15 @@ def websocket_endpoint(ws):
             data = json.loads(ws.receive())
             prompt = data.get('prompt', 'Hey there, looks like you forgot to provide a prompt!')
             
+            # Generate a unique context ID for this audio stream
+            context_id = str(uuid.uuid4())
+            
+            # Send start signal with context ID
+            ws.send(json.dumps({
+                'type': 'start',
+                'context_id': context_id
+            }))
+            
             # Generate and stream audio chunks
             syn_tokens = engine.generate_speech(
                 prompt=prompt,
@@ -83,12 +93,19 @@ def websocket_endpoint(ws):
                 # Split large chunks into smaller ones for smoother streaming
                 for i in range(0, len(chunk), chunk_size):
                     sub_chunk = chunk[i:i + chunk_size]
-                    ws.send(json.dumps({'type': 'audio_chunk', 'chunk': sub_chunk.hex()}))
+                    ws.send(json.dumps({
+                        'type': 'audio_chunk',
+                        'context_id': context_id,
+                        'chunk': sub_chunk.hex()
+                    }))
                     # Small delay to prevent overwhelming the client
                     time.sleep(0.01)
             
             # Send end signal
-            ws.send(json.dumps({'type': 'generation_complete'}))
+            ws.send(json.dumps({
+                'type': 'generation_complete',
+                'context_id': context_id
+            }))
             
         except Exception as e:
             print(f"WebSocket error: {e}")

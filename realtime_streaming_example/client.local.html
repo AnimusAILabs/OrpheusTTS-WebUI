@@ -23,6 +23,14 @@
       border-radius: 4px;
       transition: width 0.3s ease;
     }
+    #debug { 
+      margin-top: 20px;
+      padding: 10px;
+      background: #f5f5f5;
+      border-radius: 4px;
+      font-family: monospace;
+      white-space: pre-wrap;
+    }
   </style>
 </head>
 <body>
@@ -40,51 +48,96 @@
   <div id="progress">
     <div id="progressBar"></div>
   </div>
+  <div id="debug"></div>
 
   <script>
     // Use the RunPod WebSocket URL directly
     const wsUrl = 'wss://umukid49349ire-8080.proxy.runpod.net/ws';
     const ws = new WebSocket(wsUrl);
     let audioContext = null;
-    let mediaStreamDestination = null;
     let audioQueue = [];
     let isPlaying = false;
     let startTime = 0;
     let totalDuration = 0;
     let processedDuration = 0;
+    let debugLog = [];
+    let bufferSize = 0.4; // Buffer size in seconds
+    let nextPlayTime = 0;
+    let currentContextId = null;
+    let audioBuffers = new Map(); // Store audio buffers by context ID
 
     function showStatus(message) {
       document.getElementById('status').textContent = message;
+      debugLog.push(`[${new Date().toISOString()}] ${message}`);
+      updateDebug();
     }
 
     function updateProgress(progress) {
       document.getElementById('progressBar').style.width = `${progress}%`;
     }
 
-    // Initialize WebRTC audio context
+    function updateDebug() {
+      document.getElementById('debug').textContent = debugLog.join('\n');
+    }
+
+    // Initialize audio context
     function initAudio() {
       if (!audioContext) {
         audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 24000});
-        mediaStreamDestination = audioContext.createMediaStreamDestination();
+        debugLog.push(`[${new Date().toISOString()}] AudioContext initialized with sample rate: ${audioContext.sampleRate}`);
+        updateDebug();
       }
     }
 
+    // Create a new audio context
+    function createAudioContext(contextId) {
+      audioBuffers.set(contextId, []);
+      currentContextId = contextId;
+      debugLog.push(`[${new Date().toISOString()}] Created new audio context: ${contextId}`);
+      updateDebug();
+    }
+
+    // Append audio to context
+    function appendToAudioContext(contextId, audioData) {
+      if (!audioBuffers.has(contextId)) {
+        createAudioContext(contextId);
+      }
+      audioBuffers.get(contextId).push(audioData);
+      debugLog.push(`[${new Date().toISOString()}] Appended ${audioData.length} samples to context ${contextId}`);
+      updateDebug();
+    }
+
     // Process audio chunks
-    function processAudioChunk(chunk) {
+    function processAudioChunk(chunk, contextId) {
       if (!audioContext || !isPlaying) return;
 
-      const buffer = audioContext.createBuffer(1, chunk.length, 24000);
-      buffer.copyToChannel(chunk, 0);
-      
-      const source = audioContext.createBufferSource();
-      source.buffer = buffer;
-      source.connect(mediaStreamDestination);
-      
-      const currentTime = audioContext.currentTime;
-      source.start(currentTime + processedDuration);
-      
-      processedDuration += chunk.length / 24000;
-      updateProgress((processedDuration / totalDuration) * 100);
+      try {
+        const buffer = audioContext.createBuffer(1, chunk.length, 24000);
+        buffer.copyToChannel(chunk, 0);
+        
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+        
+        // Schedule the chunk to play at the next available time
+        const currentTime = audioContext.currentTime;
+        if (nextPlayTime < currentTime) {
+          nextPlayTime = currentTime;
+        }
+        
+        source.start(nextPlayTime);
+        nextPlayTime += chunk.length / 24000;
+        
+        processedDuration += chunk.length / 24000;
+        updateProgress((processedDuration / totalDuration) * 100);
+        
+        debugLog.push(`[${new Date().toISOString()}] Scheduled chunk of size ${chunk.length} samples at ${nextPlayTime.toFixed(3)}s`);
+        updateDebug();
+      } catch (error) {
+        debugLog.push(`[${new Date().toISOString()}] Error processing chunk: ${error.message}`);
+        updateDebug();
+        console.error('Error processing audio chunk:', error);
+      }
     }
 
     // Initialize controls
@@ -111,7 +164,7 @@
         
         // Process any queued chunks
         while (audioQueue.length > 0) {
-          processAudioChunk(audioQueue.shift());
+          processAudioChunk(audioQueue.shift(), currentContextId);
         }
       }
     };
@@ -137,6 +190,9 @@
       
       if (data.type === 'audio_chunk') {
         const chunk = new Uint8Array(hexToArrayBuffer(data.chunk));
+        const contextId = data.context_id || 'default';
+        debugLog.push(`[${new Date().toISOString()}] Received chunk of size ${chunk.length} bytes for context ${contextId}`);
+        updateDebug();
         
         if (!audioContext) {
           initAudio();
@@ -144,6 +200,7 @@
           pauseButton.disabled = false;
           resumeButton.disabled = true;
           showStatus('Playing audio...');
+          nextPlayTime = audioContext.currentTime + bufferSize; // Add initial buffer
         }
 
         try {
@@ -155,11 +212,13 @@
           }
           
           if (isPlaying) {
-            processAudioChunk(floatData);
+            processAudioChunk(floatData, contextId);
           } else {
             audioQueue.push(floatData);
           }
         } catch (error) {
+          debugLog.push(`[${new Date().toISOString()}] Error converting chunk: ${error.message}`);
+          updateDebug();
           console.error('Error processing audio chunk:', error);
         }
         
@@ -167,6 +226,8 @@
         console.log('Audio generation completed');
         showStatus('Audio streaming completed');
         totalDuration = processedDuration;
+        debugLog.push(`[${new Date().toISOString()}] Total duration: ${totalDuration.toFixed(2)} seconds`);
+        updateDebug();
       }
     };
 
@@ -190,7 +251,12 @@
       audioQueue = [];
       processedDuration = 0;
       totalDuration = 0;
+      nextPlayTime = 0;
+      audioBuffers.clear();
+      currentContextId = null;
       updateProgress(0);
+      debugLog = [];
+      updateDebug();
       
       // Disable controls initially
       pauseButton.disabled = true;
