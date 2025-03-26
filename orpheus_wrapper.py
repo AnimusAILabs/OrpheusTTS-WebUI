@@ -5,6 +5,12 @@ Wrapper script for Orpheus TTS to enforce vLLM configuration.
 import os
 import sys
 import logging
+import argparse
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="Orpheus TTS WebUI with configurable port")
+parser.add_argument("--port", type=int, default=8080, help="Port to run the Gradio server on (default: 8080)")
+args = parser.parse_args()
 
 # Set environment variables to control vLLM
 os.environ["VLLM_MAX_MODEL_LEN"] = "100000"
@@ -46,4 +52,10 @@ import orpheus
 
 # Actually run the Gradio app
 if __name__ == "__main__":
-    orpheus.demo.launch(share=False) 
+    # Configure for RunPod - must use port 8000 and listen on all interfaces
+    print(f"Starting Gradio server on port 8000 for RunPod...")
+    orpheus.demo.launch(
+        share=False, 
+        server_port=8000,
+        server_name="0.0.0.0"  # Listen on all interfaces, required for RunPod
+    ) 
