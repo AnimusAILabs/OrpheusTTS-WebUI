@@ -5,6 +5,7 @@ import json
 import os
 import time
 import uuid
+import numpy as np
 
 # Set environment variables for vLLM
 os.environ["VLLM_MAX_MODEL_LEN"] = "100000"
@@ -87,19 +88,34 @@ def websocket_endpoint(ws):
                 top_p=0.9
             )
             
-            # Stream chunks with controlled timing
-            chunk_size = 4096  # Optimal chunk size for streaming
+            # Buffer for accumulating audio data
+            audio_buffer = []
+            chunk_size = 16384  # Increased chunk size (about 0.68 seconds at 24kHz)
+            min_chunk_size = 8192  # Minimum chunk size before sending
+            
             for chunk in syn_tokens:
-                # Split large chunks into smaller ones for smoother streaming
-                for i in range(0, len(chunk), chunk_size):
-                    sub_chunk = chunk[i:i + chunk_size]
+                audio_buffer.extend(chunk)
+                
+                # Send chunks when we have enough data
+                while len(audio_buffer) >= chunk_size:
+                    chunk_to_send = audio_buffer[:chunk_size]
+                    audio_buffer = audio_buffer[chunk_size:]
+                    
                     ws.send(json.dumps({
                         'type': 'audio_chunk',
                         'context_id': context_id,
-                        'chunk': sub_chunk.hex()
+                        'chunk': bytes(chunk_to_send).hex()
                     }))
                     # Small delay to prevent overwhelming the client
                     time.sleep(0.01)
+            
+            # Send any remaining audio data
+            if audio_buffer:
+                ws.send(json.dumps({
+                    'type': 'audio_chunk',
+                    'context_id': context_id,
+                    'chunk': bytes(audio_buffer).hex()
+                }))
             
             # Send end signal
             ws.send(json.dumps({

@@ -30,6 +30,8 @@
       border-radius: 4px;
       font-family: monospace;
       white-space: pre-wrap;
+      max-height: 300px;
+      overflow-y: auto;
     }
   </style>
 </head>
@@ -53,7 +55,7 @@
   <script>
     // Use the RunPod WebSocket URL directly
     const wsUrl = 'wss://umukid49349ire-8080.proxy.runpod.net/ws';
-    const ws = new WebSocket(wsUrl);
+    let ws = null;
     let audioContext = null;
     let audioQueue = [];
     let isPlaying = false;
@@ -61,10 +63,16 @@
     let totalDuration = 0;
     let processedDuration = 0;
     let debugLog = [];
-    let bufferSize = 0.4; // Buffer size in seconds
+    let bufferSize = 1.0; // Buffer size in seconds
     let nextPlayTime = 0;
     let currentContextId = null;
     let audioBuffers = new Map(); // Store audio buffers by context ID
+    let isBuffering = true;
+    let minBufferSize = 0.5; // Minimum buffer size in seconds before starting playback
+    let isWebSocketReady = false;
+    let pendingPrompt = null;
+    let audioWorkletNode = null;
+    let audioWorkletProcessor = null;
 
     function showStatus(message) {
       document.getElementById('status').textContent = message;
@@ -77,11 +85,13 @@
     }
 
     function updateDebug() {
-      document.getElementById('debug').textContent = debugLog.join('\n');
+      const debugElement = document.getElementById('debug');
+      debugElement.textContent = debugLog.join('\n');
+      debugElement.scrollTop = debugElement.scrollHeight;
     }
 
     // Initialize audio context
-    function initAudio() {
+    async function initAudio() {
       if (!audioContext) {
         audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 24000});
         debugLog.push(`[${new Date().toISOString()}] AudioContext initialized with sample rate: ${audioContext.sampleRate}`);
@@ -93,6 +103,7 @@
     function createAudioContext(contextId) {
       audioBuffers.set(contextId, []);
       currentContextId = contextId;
+      isBuffering = true;
       debugLog.push(`[${new Date().toISOString()}] Created new audio context: ${contextId}`);
       updateDebug();
     }
@@ -140,6 +151,102 @@
       }
     }
 
+    // Initialize WebSocket connection
+    function initWebSocket() {
+      return new Promise((resolve, reject) => {
+        if (ws) {
+          ws.close();
+        }
+        
+        ws = new WebSocket(wsUrl);
+        isWebSocketReady = false;
+        
+        ws.onopen = () => {
+          console.log('Connected to RunPod server');
+          showStatus('Connected to RunPod server. Click Generate Audio to begin.');
+          isWebSocketReady = true;
+          resolve();
+        };
+
+        ws.onclose = () => {
+          console.log('Disconnected from RunPod server');
+          showStatus('Disconnected from RunPod server');
+          isWebSocketReady = false;
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket error:', error);
+          showStatus('WebSocket error occurred');
+          isWebSocketReady = false;
+          reject(error);
+        };
+
+        ws.onmessage = async (event) => {
+          const data = JSON.parse(event.data);
+          
+          if (data.type === 'start') {
+            currentContextId = data.context_id;
+            createAudioContext(currentContextId);
+            showStatus('Starting audio generation...');
+          }
+          
+          if (data.type === 'audio_chunk') {
+            const chunk = new Uint8Array(hexToArrayBuffer(data.chunk));
+            const contextId = data.context_id || 'default';
+            debugLog.push(`[${new Date().toISOString()}] Received chunk of size ${chunk.length} bytes for context ${contextId}`);
+            updateDebug();
+            
+            if (!audioContext) {
+              await initAudio();
+              isPlaying = true;
+              pauseButton.disabled = false;
+              resumeButton.disabled = true;
+              showStatus('Playing audio...');
+              nextPlayTime = audioContext.currentTime + bufferSize; // Add initial buffer
+            }
+
+            try {
+              // Convert 16-bit PCM to float32
+              const floatData = new Float32Array(chunk.length / 2);
+              const view = new DataView(chunk.buffer);
+              for (let i = 0; i < floatData.length; i++) {
+                floatData[i] = view.getInt16(i * 2, true) / 32768.0;
+              }
+              
+              appendToAudioContext(contextId, floatData);
+              
+              // Check if we have enough buffer to start playing
+              if (isBuffering) {
+                const totalBufferedDuration = audioBuffers.get(contextId).reduce((acc, chunk) => acc + chunk.length / 24000, 0);
+                if (totalBufferedDuration >= minBufferSize) {
+                  isBuffering = false;
+                  showStatus('Buffer filled, starting playback...');
+                  // Process all buffered chunks
+                  const buffers = audioBuffers.get(contextId);
+                  audioBuffers.set(contextId, []);
+                  buffers.forEach(chunk => processAudioChunk(chunk, contextId));
+                }
+              } else if (isPlaying) {
+                processAudioChunk(floatData, contextId);
+              }
+            } catch (error) {
+              debugLog.push(`[${new Date().toISOString()}] Error converting chunk: ${error.message}`);
+              updateDebug();
+              console.error('Error processing audio chunk:', error);
+            }
+          }
+          
+          if (data.type === 'generation_complete') {
+            console.log('Audio generation completed');
+            showStatus('Audio streaming completed');
+            totalDuration = processedDuration;
+            debugLog.push(`[${new Date().toISOString()}] Total duration: ${totalDuration.toFixed(2)} seconds`);
+            updateDebug();
+          }
+        };
+      });
+    }
+
     // Initialize controls
     const pauseButton = document.getElementById('pauseButton');
     const resumeButton = document.getElementById('resumeButton');
@@ -169,68 +276,6 @@
       }
     };
 
-    // WebSocket event handlers
-    ws.onopen = () => {
-      console.log('Connected to RunPod server');
-      showStatus('Connected to RunPod server. Click Generate Audio to begin.');
-    };
-
-    ws.onclose = () => {
-      console.log('Disconnected from RunPod server');
-      showStatus('Disconnected from RunPod server');
-    };
-
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-      showStatus('WebSocket error occurred');
-    };
-
-    ws.onmessage = async (event) => {
-      const data = JSON.parse(event.data);
-      
-      if (data.type === 'audio_chunk') {
-        const chunk = new Uint8Array(hexToArrayBuffer(data.chunk));
-        const contextId = data.context_id || 'default';
-        debugLog.push(`[${new Date().toISOString()}] Received chunk of size ${chunk.length} bytes for context ${contextId}`);
-        updateDebug();
-        
-        if (!audioContext) {
-          initAudio();
-          isPlaying = true;
-          pauseButton.disabled = false;
-          resumeButton.disabled = true;
-          showStatus('Playing audio...');
-          nextPlayTime = audioContext.currentTime + bufferSize; // Add initial buffer
-        }
-
-        try {
-          // Convert 16-bit PCM to float32
-          const floatData = new Float32Array(chunk.length / 2);
-          const view = new DataView(chunk.buffer);
-          for (let i = 0; i < floatData.length; i++) {
-            floatData[i] = view.getInt16(i * 2, true) / 32768.0;
-          }
-          
-          if (isPlaying) {
-            processAudioChunk(floatData, contextId);
-          } else {
-            audioQueue.push(floatData);
-          }
-        } catch (error) {
-          debugLog.push(`[${new Date().toISOString()}] Error converting chunk: ${error.message}`);
-          updateDebug();
-          console.error('Error processing audio chunk:', error);
-        }
-        
-      } else if (data.type === 'generation_complete') {
-        console.log('Audio generation completed');
-        showStatus('Audio streaming completed');
-        totalDuration = processedDuration;
-        debugLog.push(`[${new Date().toISOString()}] Total duration: ${totalDuration.toFixed(2)} seconds`);
-        updateDebug();
-      }
-    };
-
     // Convert hex string to ArrayBuffer
     function hexToArrayBuffer(hexString) {
       const bytes = new Uint8Array(hexString.length / 2);
@@ -240,13 +285,12 @@
       return bytes.buffer;
     }
 
-    // Form submission handler
-    document.getElementById("promptForm").addEventListener("submit", async function(event) {
-      event.preventDefault();
-      
-      // Reset state
+    // Clean up audio resources
+    function cleanupAudio() {
       if (audioContext) {
         audioContext.suspend();
+        audioContext.close();
+        audioContext = null;
       }
       audioQueue = [];
       processedDuration = 0;
@@ -254,19 +298,41 @@
       nextPlayTime = 0;
       audioBuffers.clear();
       currentContextId = null;
+      isPlaying = false;
+      isBuffering = true;
       updateProgress(0);
       debugLog = [];
       updateDebug();
-      
-      // Disable controls initially
       pauseButton.disabled = true;
       resumeButton.disabled = true;
+    }
+
+    // Form submission handler
+    document.getElementById("promptForm").addEventListener("submit", async function(event) {
+      event.preventDefault();
       
-      const prompt = document.getElementById("promptInput").value;
-      showStatus('Generating audio...');
+      // Clean up previous audio state
+      cleanupAudio();
       
-      // Request new audio generation
-      ws.send(JSON.stringify({ prompt: prompt }));
+      try {
+        // Initialize new WebSocket connection and wait for it to be ready
+        await initWebSocket();
+        
+        const prompt = document.getElementById("promptInput").value;
+        showStatus('Generating audio...');
+        
+        // Request new audio generation
+        ws.send(JSON.stringify({ prompt: prompt }));
+      } catch (error) {
+        console.error('Error initializing WebSocket:', error);
+        showStatus('Error connecting to server. Please try again.');
+      }
+    });
+
+    // Initialize WebSocket on page load
+    initWebSocket().catch(error => {
+      console.error('Error initializing WebSocket:', error);
+      showStatus('Error connecting to server. Please refresh the page.');
     });
   </script>
 </body>
